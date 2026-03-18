@@ -1,7 +1,9 @@
 import tarfile
 import re
-import glob
+import fnmatch
 import smtplib
+import subprocess
+import sys
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import parseaddr, formataddr
@@ -15,7 +17,30 @@ pymupdf.layout.activate()
 
 import pymupdf4llm  # noqa: E402
 
-def extract_tex_code_from_tar(file_path:str, paper_id:str) -> dict[str,str]:
+PDF_EXTRACT_SCRIPT = r"""
+from pathlib import Path
+import sys
+
+import pymupdf
+import pymupdf.layout
+import pymupdf4llm
+
+pymupdf.TOOLS.mupdf_display_errors(False)
+pymupdf.layout.activate()
+
+file_path = sys.argv[1]
+output_path = Path(sys.argv[2])
+markdown = pymupdf4llm.to_markdown(
+    file_path,
+    use_ocr=False,
+    header=False,
+    footer=False,
+    ignore_code=True,
+)
+output_path.write_text(markdown, encoding="utf-8")
+"""
+
+def extract_tex_code_from_tar(file_path:str, paper_id:str) -> dict[str,str | None] | None:
     try:
         tar = tarfile.open(file_path)
     except tarfile.ReadError:
@@ -51,8 +76,12 @@ def extract_tex_code_from_tar(file_path:str, paper_id:str) -> dict[str,str]:
     #read all tex files
     file_contents = {}
     for t in tex_files:
-        f = tar.extractfile(t)
-        content = f.read().decode('utf-8',errors='ignore')
+        extracted = tar.extractfile(t)
+        if extracted is None:
+            logger.debug(f"Failed to read tex file {t} of {paper_id}: File not found in tar.")
+            continue
+        with extracted as f:
+            content = f.read().decode('utf-8',errors='ignore')
         #remove comments
         content = re.sub(r'%.*\n', '\n', content)
         content = re.sub(r'\\begin{comment}.*?\\end{comment}', '', content, flags=re.DOTALL)
@@ -88,9 +117,48 @@ def extract_tex_code_from_tar(file_path:str, paper_id:str) -> dict[str,str]:
 def extract_markdown_from_pdf(file_path:str) -> str:
     return pymupdf4llm.to_markdown(file_path,use_ocr=False,header=False,footer=False,ignore_code=True)
 
+
+def extract_markdown_from_pdf_with_timeout(file_path: str, timeout: int, output_path: str) -> str | None:
+    try:
+        subprocess.run(
+            [sys.executable, "-c", PDF_EXTRACT_SCRIPT, file_path, output_path],
+            check=True,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(f"PDF extraction timed out for {file_path}")
+        return None
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip() if e.stderr else str(e)
+        logger.warning(f"Failed to extract markdown from pdf {file_path}: {stderr}")
+        return None
+
+    with open(output_path, encoding="utf-8") as f:
+        return f.read()
+
 def glob_match(path:str, pattern:str) -> bool:
-    re_pattern = glob.translate(pattern,recursive=True)
-    return re.match(re_pattern, path) is not None
+    path_parts = [] if path == '' else path.split('/')
+    pattern_parts = [] if pattern == '' else pattern.split('/')
+
+    def _match(pattern_index: int, path_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+
+        current_pattern = pattern_parts[pattern_index]
+        if current_pattern == '**':
+            return _match(pattern_index + 1, path_index) or (
+                path_index < len(path_parts) and _match(pattern_index, path_index + 1)
+            )
+
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], current_pattern)
+            and _match(pattern_index + 1, path_index + 1)
+        )
+
+    return _match(0, 0)
 
 def send_email(config:DictConfig, html:str):
     sender = config.email.sender

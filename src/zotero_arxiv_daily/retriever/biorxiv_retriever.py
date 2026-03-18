@@ -6,7 +6,7 @@ from typing import Any
 from time import sleep
 
 @register_retriever("biorxiv")
-class BiorxivRetriever(BaseRetriever):
+class BiorxivRetriever(BaseRetriever[dict[str, Any]]):
     server = "biorxiv"
 
     def __init__(self, config):
@@ -18,6 +18,7 @@ class BiorxivRetriever(BaseRetriever):
         api_url = f"https://api.biorxiv.org/details/{self.server}/2d"
         retry_num = 10
         delay_time = 10
+        response = None
         for i in range(retry_num):
             try:
                 response = requests.get(api_url)
@@ -29,6 +30,8 @@ class BiorxivRetriever(BaseRetriever):
                 else:
                     logger.warning(f"Failed to retrieve papers: {str(e)}. Retry in {delay_time} seconds.")
                     sleep(delay_time)
+        if response is None:
+            return []
         result = response.json()
         collection = result['collection']
         if len(collection) == 0:
